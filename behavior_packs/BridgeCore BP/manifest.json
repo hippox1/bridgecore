@@ -1,0 +1,41 @@
+{
+	"format_version": 2,
+	"header": {
+		"name": "BridgeCore BP",
+		"description": "BridgeCore Behavior Pack",
+		"uuid": "c744c7ab-83bf-484a-890d-afbff7ed4c46",
+		"version": [1, 0, 0],
+		"min_engine_version": [1, 21, 100]
+	},
+	"modules": [
+		{
+			"version": [1, 0, 0],
+			"uuid": "f0b39598-e069-4af0-a303-67f07959aab1",
+			"type": "data"
+		},
+        {
+            "type": "script",
+            "language": "javascript",
+            "uuid": "ac32ce21-79d8-46cf-8bde-f0d9318dae36",
+            "version": [1, 0, 0],
+            "entry": "scripts/code.js"
+        }
+	],
+	"dependencies": [
+        {
+            "module_name": "@minecraft/server",
+            "version": "2.1.0"
+        },
+        {
+            "module_name": "@minecraft/server-ui",
+            "version": "2.0.0"
+        },
+        {
+            "module_name": "@minecraft/common",
+            "version": "1.2.0"
+        }
+    ],
+    "capabilities": [
+        "script_eval"
+    ]
+}
