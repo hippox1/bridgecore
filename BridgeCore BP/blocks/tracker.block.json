@@ -1,0 +1,28 @@
+{
+	"format_version": "1.21.100",
+	"minecraft:block": {
+		"description": {
+			"identifier": "test:tracker",
+			"menu_category": {
+				"category": "construction"
+			}
+		},
+		"components": {
+			"minecraft:replaceable": {},
+			"minecraft:collision_box": false,
+			"minecraft:selection_box": false,
+			"minecraft:destructible_by_mining": false,
+			"minecraft:destructible_by_explosion": {
+				"explosion_resistance": 15
+			},
+			"minecraft:geometry": "geometry.tracker",
+			"minecraft:material_instances": {
+				"*": {
+					"texture": "tracker",
+					"render_method": "alpha_test_single_sided_to_opaque"
+				}
+			},
+			"minecraft:map_color": "#ffffff"
+		}
+	}
+}
