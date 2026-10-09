@@ -5,102 +5,17 @@ const trackerBlockType = "test:tracker"; // update if needed
 const detectorBlockType = "test:detector"; // update if needed
 const voidLevel = 30; // update if needed
 
+// ===== VOID RESPAWN SETTINGS =====
+// When a player who fell into the void gets their items back (run modes and pattern learning):
+//   "immediate"  : items are given after the minimum delay below. Old blocks keep clearing in the background.
+//   "afterClear" : items are given only after every old block is cleared (and after the minimum delay).
+const VOID_ITEM_TIMING = "immediate";
+// Minimum delay before items are given after a void, in ticks (20 ticks = 1 second, 10 = 0.5 seconds, 0 = right away)
+const VOID_ITEM_MIN_DELAY_TICKS = 10;
+
 const totalBlocks = new Map();
 const rightClicks = new Map();
-const playerTickingAreas = new Map(); // Maps player name -> tickingArea name
 let worldOwnerName = null;
-
-// Function to get the next available ticking area name (tickingArea1 to tickingArea10)
-function getAvailableTickingAreaName() {
-    const dim = world.getDimension("overworld");
-    const usedNames = new Set(playerTickingAreas.values());
-    
-    for (let i = 1; i <= 10; i++) {
-        const name = `tickingArea${i}`;
-        if (!usedNames.has(name)) {
-            return name;
-        }
-    }
-    
-    // If all are taken, reuse tickingArea1 (delete old one first)
-    return "tickingArea1";
-}
-
-// Function to create a circular ticking area with radius 4 at a given position
-function createTickingArea(position, playerName) {
-    try {
-        const dim = world.getDimension("overworld");
-        
-        // Get available name
-        const areaName = getAvailableTickingAreaName();
-        
-        // Delete the old ticking area if it exists (to avoid duplicates)
-        try {
-            dim.runCommand(`tickingarea remove "${areaName}"`);
-        } catch (err) {
-            // Area doesn't exist, that's fine
-        }
-        
-        // Create circular ticking area with radius 4
-        const radius = 4;
-        system.runTimeout(() => {
-        dim.runCommand(`tickingarea add circle ${Math.floor(position.x)} ${Math.floor(position.y)} ${Math.floor(position.z)} ${radius} "${areaName}"`);
-        
-        // Track which player created this ticking area
-        playerTickingAreas.set(playerName, areaName);
-        }, 30); // delay to ensure player has fully teleported before creating ticking area
-        
-        return areaName;
-    } catch (err) {
-        console.warn(`Failed to create ticking area at ${position}:`, err);
-        return null;
-    }
-}
-
-// Function to delete a specific player's ticking area
-function deletePlayerTickingArea(playerName) {
-    try {
-        system.runTimeout(() => {
-            const areaName = playerTickingAreas.get(playerName);
-            if (areaName) {
-                const dim = world.getDimension("overworld");
-                try {
-                    dim.runCommand(`tickingarea remove "${areaName}"`);
-                } catch (err) {
-                    // Area might not exist
-                }
-                playerTickingAreas.delete(playerName);
-            }
-        }, 30); // delay to ensure any pending operations related to the ticking area are completed before deletion
-    } catch (err) {
-        console.warn(`Failed to delete ticking area for ${playerName}:`, err);
-    }
-}
-
-// Function to delete all ticking areas
-function deleteAllTickingAreas() {
-    try {
-        system.runTimeout(() => {
-            const dim = world.getDimension("overworld");
-            for (let i = 1; i <= 10; i++) {
-                try {
-                    dim.runCommand(`tickingarea remove "tickingArea${i}"`);
-                } catch (err) {
-                    // Area doesn't exist, continue
-                }
-            }
-            playerTickingAreas.clear();
-        }, 30); // delay to ensure any pending operations related to the ticking areas are completed before deletion
-    } catch (err) {
-        console.warn("Failed to delete ticking areas:", err);
-    }
-}
-
-// Function to count players in a specific speedbridge mode variant
-function countPlayersInSpeedBridgeMode(modeVariant) {
-    const players = world.getPlayers();
-    return players.filter(p => p.hasTag(`speedbridge_${modeVariant}`)).length;
-}
 
 // Helper function to get the current game mode and variant for block placement tracking
 function getCurrentModeForBlockTracking(player) {
@@ -130,72 +45,318 @@ function getCurrentModeForBlockTracking(player) {
     return null;
 }
 
-// Helper function to build the dynamic property key
-function getPlacedBlocksPropKey(mode, variant) {
-    return `placedBlocks_${mode}_${variant}`;
+// ===== PLACED BLOCK TRACKING AND RESET =====
+// Blocks placed by non-admin players are saved in world dynamic properties, keyed by
+// player slot + mode + variant, so the list survives the player leaving the world.
+//   B<jobId>_<n>  blocks placed since the last reset
+//   P<jobId>_<n>  blocks waiting to be removed
+// A reset moves the B list into the P list. The removal queue then works through the P list one block at a time:
+// temporary ticking area on the block -> set it to air -> remove the ticking area -> next block.
+
+const MODE_CODES = { speedbridge: 'sb', parkour: 'pk', gauntlet: 'gt', bedwarsRush: 'br', freestyle: 'fs' };
+const SLOT_MAP_KEY = 'blockSlots';
+const BLOCK_CHUNK_NUMBERS = 2400; // 800 blocks per property, keeps each string under the 32,767 byte limit
+const CLEAR_AREA_ID = 'bridgecore_clear';
+const CLEAR_CHUNK_TIMEOUT = 200; // ticks to keep trying a block's chunk before skipping that block
+
+function sleep(ticks) {
+    return new Promise(resolve => system.runTimeout(() => resolve(), ticks));
+}
+
+// Player name -> short numeric slot, so storage keys never depend on the player name
+let slotMapCache = null;
+function getSlotMap() {
+    if (slotMapCache === null) {
+        try {
+            const raw = world.getDynamicProperty(SLOT_MAP_KEY);
+            slotMapCache = typeof raw === 'string' ? JSON.parse(raw) : {};
+        } catch (err) {
+            slotMapCache = {};
+        }
+    }
+    return slotMapCache;
+}
+
+function getPlayerSlot(playerName, create) {
+    const map = getSlotMap();
+    if (map[playerName] !== undefined) return map[playerName];
+    if (!create) return undefined;
+    const slot = Math.max(0, ...Object.values(map)) + 1;
+    map[playerName] = slot;
+    world.setDynamicProperty(SLOT_MAP_KEY, JSON.stringify(map));
+    return slot;
+}
+
+function getJobId(slot, mode, variant) {
+    return `${slot}_${MODE_CODES[mode] ?? 'xx'}_${variant}`;
+}
+
+// Reads a whole block list (all of its chunks) as [{ x, y, z }, ...]
+function readBlockList(base) {
+    const blocks = [];
+    for (let i = 0; ; i++) {
+        const raw = world.getDynamicProperty(`${base}_${i}`);
+        if (typeof raw !== 'string') break;
+        let flat = [];
+        try { flat = JSON.parse(raw); } catch (err) { flat = []; }
+        for (let j = 0; j + 2 < flat.length; j += 3) {
+            blocks.push({ x: flat[j], y: flat[j + 1], z: flat[j + 2] });
+        }
+    }
+    return blocks;
+}
+
+// Replaces a whole block list. An empty array removes it.
+function writeBlockList(base, blocks) {
+    const flat = [];
+    for (const b of blocks) flat.push(b.x, b.y, b.z);
+    let i = 0;
+    for (let start = 0; start < flat.length; start += BLOCK_CHUNK_NUMBERS, i++) {
+        world.setDynamicProperty(`${base}_${i}`, JSON.stringify(flat.slice(start, start + BLOCK_CHUNK_NUMBERS)));
+    }
+    // Remove chunks left over from a longer list
+    while (world.getDynamicProperty(`${base}_${i}`) !== undefined) {
+        world.setDynamicProperty(`${base}_${i}`, undefined);
+        i++;
+    }
+}
+
+// Adds one block to the end of a list
+function appendBlockToList(base, x, y, z) {
+    let i = 0;
+    while (world.getDynamicProperty(`${base}_${i + 1}`) !== undefined) i++;
+    let flat = [];
+    const raw = world.getDynamicProperty(`${base}_${i}`);
+    if (typeof raw === 'string') {
+        try { flat = JSON.parse(raw); } catch (err) { flat = []; }
+    }
+    if (flat.length >= BLOCK_CHUNK_NUMBERS) {
+        i++;
+        flat = [];
+    }
+    flat.push(x, y, z);
+    world.setDynamicProperty(`${base}_${i}`, JSON.stringify(flat));
 }
 
 function getPlayerPlacedBlocks(player) {
     if (player.hasTag('buildmode') || player.hasTag('admin')) return [];
-    try {
-        const modeInfo = getCurrentModeForBlockTracking(player);
-        if (!modeInfo) return [];
-        
-        const propKey = getPlacedBlocksPropKey(modeInfo.mode, modeInfo.variant);
-        const placedBlocksStr = player.getDynamicProperty?.(propKey);
-        if (typeof placedBlocksStr === 'string') {
-            return JSON.parse(placedBlocksStr);
-        }
-        return [];
-    } catch (err) {
-        return [];
+    const modeInfo = getCurrentModeForBlockTracking(player);
+    const slot = getPlayerSlot(player.name, false);
+    if (!modeInfo || slot === undefined) return [];
+    return readBlockList(`B${getJobId(slot, modeInfo.mode, modeInfo.variant)}`);
+}
+
+function addPlacedBlockForPlayer(player, blockLocation) {
+    if (player.hasTag('buildmode') || player.hasTag('admin')) return;
+    const modeInfo = getCurrentModeForBlockTracking(player);
+    if (!modeInfo) return;
+    const slot = getPlayerSlot(player.name, true);
+    appendBlockToList(
+        `B${getJobId(slot, modeInfo.mode, modeInfo.variant)}`,
+        Math.floor(blockLocation.x),
+        Math.floor(blockLocation.y),
+        Math.floor(blockLocation.z)
+    );
+}
+
+// ----- Removal queue: one job at a time, one block at a time -----
+const clearQueue = [];
+const queuedJobCounts = new Map(); // jobId -> number of jobs waiting or running
+let clearWorkerRunning = false;
+
+// Moves everything placed since the last reset into the pending list and queues its removal.
+// onDone runs once every block that existed at this point has been removed.
+function requestBlockReset(jobId, onDone) {
+    const liveBase = `B${jobId}`;
+    const pendingBase = `P${jobId}`;
+    const live = readBlockList(liveBase);
+    if (live.length > 0) {
+        // Write the pending list before emptying the live list, so a server stop can't lose blocks
+        writeBlockList(pendingBase, readBlockList(pendingBase).concat(live));
+        writeBlockList(liveBase, []);
     }
-}
-
-function setPlayerPlacedBlocks(player, arr) {
-    if (player.hasTag('buildmode') || player.hasTag('admin')) return;
-    try {
-        const modeInfo = getCurrentModeForBlockTracking(player);
-        if (!modeInfo) return;
-        
-        const propKey = getPlacedBlocksPropKey(modeInfo.mode, modeInfo.variant);
-        const jsonStr = JSON.stringify(Array.isArray(arr) ? arr : []);
-        player.setDynamicProperty?.(propKey, jsonStr);
-    } catch (err) {
-        console.warn(`Failed to save placed blocks for ${player.name}:`, err);
-    }
-}
-
-function addPlacedBlockForPlayer(player, blockLocation, blockType) {
-    if (player.hasTag('buildmode') || player.hasTag('admin')) return;
-    const list = getPlayerPlacedBlocks(player);
-    list.push({
-        x: Math.floor(blockLocation.x),
-        y: Math.floor(blockLocation.y),
-        z: Math.floor(blockLocation.z),
-        type: blockType,
-        ts: Date.now()
-    });
-    setPlayerPlacedBlocks(player, list);
-}
-
-function clearPlacedBlocksForPlayer(player) {
-    if (player.hasTag('buildmode') || player.hasTag('admin')) return;
-    const list = getPlayerPlacedBlocks(player);
-    if (!Array.isArray(list) || list.length === 0) {
+    const hasPending = world.getDynamicProperty(`${pendingBase}_0`) !== undefined;
+    if (!hasPending && !queuedJobCounts.has(jobId)) {
+        if (onDone) onDone();
         return;
     }
-    system.runTimeout(() => {
-        for (const loc of list) {
+    queueClearJob(jobId, onDone);
+}
+
+function queueClearJob(jobId, onDone) {
+    clearQueue.push({ jobId, onDone });
+    queuedJobCounts.set(jobId, (queuedJobCounts.get(jobId) ?? 0) + 1);
+    if (!clearWorkerRunning) runClearWorker();
+}
+
+async function runClearWorker() {
+    clearWorkerRunning = true;
+    while (clearQueue.length > 0) {
+        const job = clearQueue.shift();
+        try {
+            await clearPendingBlocks(job.jobId);
+        } catch (err) {
+            console.warn(`[BlockClear] Job ${job.jobId} failed:`, err);
+        }
+        const left = (queuedJobCounts.get(job.jobId) ?? 1) - 1;
+        if (left > 0) queuedJobCounts.set(job.jobId, left);
+        else queuedJobCounts.delete(job.jobId);
+        if (job.onDone) {
             try {
-                player.runCommand(`setblock ${Math.floor(loc.x)} ${Math.floor(loc.y)} ${Math.floor(loc.z)} air`);
+                job.onDone();
             } catch (err) {
-                // ignore failures
+                // The player may have left before the callback ran
             }
         }
-        setPlayerPlacedBlocks(player, []);
-    }, 5);
+    }
+    clearWorkerRunning = false;
 }
+
+async function clearPendingBlocks(jobId) {
+    const pendingBase = `P${jobId}`;
+    const listed = readBlockList(pendingBase);
+    if (listed.length === 0) return;
+    // A block that was broken and placed again is listed twice. Clear each position once, so a block
+    // placed there after the first removal is not deleted by the second entry.
+    const seen = new Set();
+    const batch = listed.filter(b => {
+        const k = `${b.x},${b.y},${b.z}`;
+        if (seen.has(k)) return false;
+        seen.add(k);
+        return true;
+    });
+    const dim = world.getDimension("overworld");
+    for (const pos of batch) {
+        await clearOneBlock(dim, pos);
+        await sleep(1);
+    }
+    // Keep anything another reset added to the pending list during this batch
+    writeBlockList(pendingBase, readBlockList(pendingBase).slice(listed.length));
+}
+
+// Makes sure the block's chunk gets loaded. Uses the ticking area manager when the server has it,
+// otherwise the ticking area command the script used before the manager existed.
+function startClearArea(dim, pos) {
+    if (world.tickingAreaManager) {
+        return world.tickingAreaManager
+            .createTickingArea(CLEAR_AREA_ID, { dimension: dim, from: pos, to: pos })
+            .then(() => true, () => false);
+    }
+    try {
+        dim.runCommand(`tickingarea add circle ${pos.x} ${pos.y} ${pos.z} 4 "${CLEAR_AREA_ID}"`);
+        return Promise.resolve(true);
+    } catch (err) {
+        return Promise.resolve(false);
+    }
+}
+
+// Sets the block to air. Returns true only when the block reads back as air,
+// so a chunk that is still loading counts as a failed attempt and the caller tries again.
+function setBlockToAir(dim, pos) {
+    try {
+        if (typeof dim.setBlockType === 'function') {
+            dim.setBlockType(pos, "minecraft:air");
+        } else {
+            dim.runCommand(`setblock ${pos.x} ${pos.y} ${pos.z} air`);
+        }
+        const block = dim.getBlock(pos);
+        return block !== undefined && block.typeId === "minecraft:air";
+    } catch (err) {
+        return false;
+    }
+}
+
+// Loads the block's chunk with a temporary ticking area, removes the block, then removes the area
+async function clearOneBlock(dim, pos) {
+    removeClearArea(dim);
+    try {
+        const areaOk = await Promise.race([startClearArea(dim, pos), sleep(CLEAR_CHUNK_TIMEOUT).then(() => false)]);
+        if (areaOk) {
+            for (let attempt = 0; attempt < CLEAR_CHUNK_TIMEOUT; attempt++) {
+                if (setBlockToAir(dim, pos)) return;
+                await sleep(1);
+            }
+        }
+        console.warn(`[BlockClear] Skipped ${pos.x} ${pos.y} ${pos.z}: chunk did not load in time`);
+    } catch (err) {
+        console.warn(`[BlockClear] Could not clear ${pos.x} ${pos.y} ${pos.z}:`, err);
+    } finally {
+        removeClearArea(dim);
+    }
+}
+
+function removeClearArea(dim) {
+    try {
+        if (world.tickingAreaManager) {
+            if (world.tickingAreaManager.hasTickingArea(CLEAR_AREA_ID)) {
+                world.tickingAreaManager.removeTickingArea(CLEAR_AREA_ID);
+            }
+        } else {
+            dim.runCommand(`tickingarea remove "${CLEAR_AREA_ID}"`);
+        }
+    } catch (err) {
+        // Nothing to remove
+    }
+}
+
+// Resets a player's list for one mode/variant. onDone runs when the blocks are gone (or straight away if there were none).
+function resetPlacedBlocks(player, mode, variant, onDone) {
+    if (player.hasTag('buildmode') || player.hasTag('admin')) {
+        if (onDone) onDone();
+        return;
+    }
+    const slot = getPlayerSlot(player.name, false);
+    if (slot === undefined) {
+        if (onDone) onDone();
+        return;
+    }
+    requestBlockReset(getJobId(slot, mode, variant), onDone);
+}
+
+// Same as resetPlacedBlocks, for the mode the player is currently in
+function resetPlacedBlocksForPlayer(player, onDone) {
+    const modeInfo = getCurrentModeForBlockTracking(player);
+    if (!modeInfo) {
+        if (onDone) onDone();
+        return;
+    }
+    resetPlacedBlocks(player, modeInfo.mode, modeInfo.variant, onDone);
+}
+
+// Called when a player leaves. Their saved lists are cleared in the background, so they don't need to be online.
+function clearBlocksOfLeavingPlayer(playerName) {
+    const slot = getPlayerSlot(playerName, false);
+    if (slot === undefined) return;
+    const prefix = `${slot}_`;
+    const jobIds = new Set();
+    for (const key of world.getDynamicPropertyIds()) {
+        const match = /^[BP](.+)_\d+$/.exec(key);
+        if (match && match[1].startsWith(prefix)) jobIds.add(match[1]);
+    }
+    for (const jobId of jobIds) {
+        requestBlockReset(jobId);
+    }
+}
+
+// On startup: remove the ticking areas from the old system, and finish any clear interrupted by a restart
+system.run(() => {
+    const overworld = world.getDimension("overworld");
+    for (let i = 1; i <= 10; i++) {
+        try {
+            overworld.runCommand(`tickingarea remove "tickingArea${i}"`);
+        } catch (err) {
+            // Not present
+        }
+    }
+    const interrupted = new Set();
+    for (const key of world.getDynamicPropertyIds()) {
+        const match = /^P(.+)_\d+$/.exec(key);
+        if (match) interrupted.add(match[1]);
+    }
+    for (const jobId of interrupted) {
+        queueClearJob(jobId);
+    }
+});
 
 const runState = new Map();
 function getStateFor(player) {
@@ -415,13 +576,14 @@ function stopRun(player) {
         if (modeInfo) {
             player.runCommand('clear @s');
             system.runTimeout(() => {
-                clearPlacedBlocksForPlayer(player);
                 player.addTag('run');
-                giveItem(player);
                 player.teleport(modeInfo.pos, { facingLocation: modeInfo.facing });
-                if (mode === 'gauntlet') {
-                    replaceTracker(player);
-                }
+                resetPlacedBlocks(player, mode, variant, () => {
+                    giveItem(player);
+                    if (mode === 'gauntlet') {
+                        replaceTracker(player);
+                    }
+                });
             }, 60);
         }
     } catch (e) { /* ignore if coords not available */ }
@@ -504,6 +666,56 @@ function resetAllBestTimes(player) {
     world.sendMessage(`§c§l${player.name}§c's Best times have been reset!`);
 }
 
+function resetCurrentModeBestTime(player) {
+    // Check if player is in a mode/variance
+    const modeInfo = getModeAndVariant(player);
+    if (!modeInfo) {
+        // Player is not in any mode, do nothing silently
+        return;
+    }
+
+    const { mode, variant } = modeInfo;
+    const s = getStateFor(player);
+    
+    // Reset only the best time for this specific mode/variant
+    if (s.bestTimes[mode]) {
+        delete s.bestTimes[mode][variant];
+    }
+    
+    setPlayerBestTimes(player, s.bestTimes);
+    player.sendMessage(`§c§l${player.name}§c's §b${mode} - ${variant}§c best time has been reset!`);
+}
+
+// Decides when items are given back after a void.
+// The action runs once the minimum delay has passed and, when VOID_ITEM_TIMING is not "immediate",
+// once the reset reports that the old blocks are gone. The returned function is the reset's onDone.
+function afterVoidGate(player, action) {
+    const waitForClear = VOID_ITEM_TIMING !== "immediate";
+    let delayDone = false;
+    let clearDone = !waitForClear;
+    let ran = false;
+    const tryRun = () => {
+        if (ran || !delayDone || !clearDone) return;
+        ran = true;
+        try {
+            action();
+        } catch (err) {
+            // The player may have left in the meantime
+        }
+    };
+    const delayed = cb => VOID_ITEM_MIN_DELAY_TICKS > 0
+        ? system.runTimeout(cb, VOID_ITEM_MIN_DELAY_TICKS)
+        : system.run(cb);
+    delayed(() => {
+        delayDone = true;
+        tryRun();
+    });
+    return () => {
+        clearDone = true;
+        tryRun();
+    };
+}
+
 function respawnRun(player) {
     const s = getStateFor(player);
     
@@ -527,19 +739,20 @@ function respawnRun(player) {
     try {
         const modeInfo = getModeAndVariant(player);
         if (modeInfo) {
-            if (modeInfo) {
-                player.runCommand('clear @s');
-                clearPlacedBlocksForPlayer(player);
-                player.addTag('run');
-                giveItem(player);
-                player.teleport(modeInfo.pos, { facingLocation: modeInfo.facing });
-                system.runTimeout(() => {
-                    player.onScreenDisplay.setActionBar(`§cTime: §r${displayElapsed}`); // show elapsed time instead of reset message
-                }, 1);
+            player.runCommand('clear @s');
+            player.addTag('run');
+            player.teleport(modeInfo.pos, { facingLocation: modeInfo.facing });
+            const itemsReady = afterVoidGate(player, () => giveItem(player));
+            resetPlacedBlocks(player, modeInfo.mode, modeInfo.variant, () => {
+                itemsReady();
+                // Trackers go back only after the old blocks are gone, otherwise the removal would delete them
                 if (modeInfo.mode === 'gauntlet') {
                     replaceTracker(player);
                 }
-            }
+            });
+            system.runTimeout(() => {
+                player.onScreenDisplay.setActionBar(`§cTime: §r${displayElapsed}`); // show elapsed time instead of reset message
+            }, 1);
         }
     } catch (e) {
         /* ignore if coords not available */
@@ -708,8 +921,8 @@ system.runInterval(() => {
             if (player.hasTag('freestyle')) {
                 if (player.hasTag('noScore')) {
                     player.teleport(coords.freestyle.noScore.pos);
-                    clearPlacedBlocksForPlayer(player);
                     totalBlocks.set(player, 0);
+                    resetPlacedBlocksForPlayer(player);
                 } else if (player.hasTag('oneblock')) {
                     player.removeTag('startOneBlock');
                     system.runTimeout(() => {
@@ -717,35 +930,34 @@ system.runInterval(() => {
                         dim.runCommand(`setblock 2000 49 1000 bedrock`);
                     }, 2);
                     player.teleport(coords.freestyle.oneBlock.pos);
-                    clearPlacedBlocksForPlayer(player);
                     totalBlocks.set(player, 0);
+                    resetPlacedBlocksForPlayer(player);
                 } else if (player.hasTag('customisland')) {
                     player.teleport(coords.freestyle.customIsland.pos);
-                    clearPlacedBlocksForPlayer(player);
                     totalBlocks.set(player, 0);
+                    resetPlacedBlocksForPlayer(player);
                 } else if (player.hasTag('patternlearning')) {
                     const runState = getPatternRunState(player);
-                    if (runState.active) {
-                        // Run has started: TP back, give items, clear placed blocks, set coords to trackerBlocks
-                        player.teleport(coords.freestyle.patternLearning.pos);
-                        clearPlacedBlocksForPlayer(player);
-                        system.runTimeout(() => {
-                            replaceDetectorsWithTrackers(player);
-                        }, 5);
-                        giveItem(player);
+                    const wasRunning = runState.active;
+                    player.teleport(coords.freestyle.patternLearning.pos);
+                    if (wasRunning) {
+                        // A run was in progress: stop its timer, then restore the trackers and items after the blocks are gone
                         if (runState.timerId) {
                             system.clearRun(runState.timerId);
                             runState.timerId = null;
                         }
                         runState.active = false;
                         runState.startTime = null;
-                    } else {
-                        // Run hasn't started: TP back only
-                        player.teleport(coords.freestyle.patternLearning.pos);
                     }
                     player.onScreenDisplay.setActionBar(`§cVoid!`);
-                    clearPlacedBlocksForPlayer(player);
                     totalBlocks.set(player, 0);
+                    const itemsReady = wasRunning ? afterVoidGate(player, () => giveItem(player)) : null;
+                    resetPlacedBlocksForPlayer(player, () => {
+                        if (wasRunning) {
+                            replaceDetectorsWithTrackers(player);
+                            itemsReady();
+                        }
+                    });
                 }
             }
             if (player.hasTag('run')) {
@@ -768,7 +980,7 @@ world.afterEvents.playerBreakBlock.subscribe(event => {
     // Handle detector block breaking in edit mode
     if (blockType === detectorBlockType && player.hasTag('patternlearning') && player.hasTag('buildmode')) {
         removePatternCoord(player, Math.floor(x), Math.floor(y), Math.floor(z));
-        player.onScreenDisplay.setActionBar(`§cDetector removed! Coords removed.`);
+        player.onScreenDisplay.setActionBar(`§cDetector removed!`);
     }
 });
 
@@ -788,7 +1000,7 @@ world.afterEvents.playerPlaceBlock.subscribe(event => {
     // CASE 1: Edit mode - handle detector placement
     if (isEditMode && isDetectorBlock) {
         addPatternCoord(player, Math.floor(x), Math.floor(y), Math.floor(z));
-        player.onScreenDisplay.setActionBar(`§aDetector placed! Coords saved.`);
+        player.onScreenDisplay.setActionBar(`§aDetector placed!`);
         return;
     }
     
@@ -1002,12 +1214,11 @@ function endPatternRun(player) {
     // Clear inventory and teleport back
     player.runCommand('clear @s');
     system.runTimeout(() => {
-        clearPlacedBlocksForPlayer(player);
-        system.runTimeout(() => {
-        replaceDetectorsWithTrackers(player);
-        }, 5);
-        giveItem(player);
         player.teleport(coords.freestyle.patternLearning.pos);
+        resetPlacedBlocks(player, 'freestyle', 'patternLearning', () => {
+            replaceDetectorsWithTrackers(player);
+            giveItem(player);
+        });
     }, 40);
 }
 
@@ -1043,61 +1254,49 @@ const coords = {
     freestyle: {
         noScore: { 
             pos: { x: 1000.5, y: 50, z: 2000.5 },
-            tickingArea: { x: 1000, y: 50, z: 2000 }
         },
         oneBlock: { 
             pos: { x: 2000.5, y: 51, z: 1000.5 },
-            tickingArea: { x: 2000, y: 50, z: 1000 }
         },
         customIsland: { 
             pos: { x: 2000.5, y: 50, z: 2000.5 },
-            tickingArea: { x: 2000, y: 50, z: 2000 }
         },
         patternLearning: { 
             pos: { x: 1000.5, y: 50, z: 1000.5 },
-            tickingArea: { x: 1000, y: 50, z: 1000 }
         }
     },
     rush: {
         city: {
             pos: { x: -1999.5, y: 50, z: 1500.5 },
             facing: { x: -1999.5, y: 50, z: 1501.5 },
-            tickingArea: { x: -2000, y: 50, z: 1660 }
         },
         paradise: {
             pos: { x: -1999.5, y: 50, z: 500.5 },            
             facing: { x: -1999.5, y: 50, z: 501.5 },
-            tickingArea: { x: -1991, y: 50, z: 640 }
         },
         citadel: {
             pos: { x: -1999.5, y: 50, z: -499.5 },
             facing: { x: -1999.5, y: 50, z: -500.5 },
-            tickingArea: { x: -1997, y: 50, z: -600 }
         },
         luck: {
             pos: { x: -1999.5, y: 50, z: -1499.5 },
             facing: { x: -1999.5, y: 50, z: -1498.5 },
-            tickingArea: { x: -2000, y: 50, z: -1345 }
         },
         village: {
             pos: { x: -999.5, y: 50, z: 1500.5 },
             facing: { x: -999.5, y: 50, z: 1499.5 },
-            tickingArea: { x: -1004, y: 50, z: 1420 }
         },
         wasteland: {
             pos: { x: -999.5, y: 50, z: 500.5 },
             facing: { x: -999.5, y: 50, z: 499.5 },
-            tickingArea: { x: -1000, y: 50, z: 380 }
         },
         nether: {
             pos: { x: -999.5, y: 50, z: -499.5 },
             facing: { x: -1000.5, y: 50, z: -499.5 },
-            tickingArea: { x: -1110, y: 50, z: -500 }
         },
         temple: {
             pos: { x: -999.5, y: 50, z: -1499.5 },
             facing: { x: -999.5, y: 50, z: -1500.5 },
-            tickingArea: { x: -1002, y: 50, z: -1605 }
         }
     },
     speedbridge: {
@@ -1122,7 +1321,6 @@ const coords = {
                 pos: { x: 540.5, y: 50, z: -500.5 },
                 facing: { x: 540.5, y: 50, z: -501.5 }
             },
-            tickingArea: { x: 500, y: 50, z: -500 }
         },
         normal: {
             no1: {
@@ -1145,7 +1343,6 @@ const coords = {
                 pos: { x: 1040.5, y: 50, z: -500.5 },
                 facing: { x: 1040.5, y: 50, z: -501.5 }
             },
-            tickingArea: { x: 1000, y: 50, z: -500 }
         },
         long: {
             no1: {
@@ -1168,7 +1365,6 @@ const coords = {
                 pos: { x: 1540.5, y: 50, z: -500.5 },
                 facing: { x: 1540.5, y: 50, z: -501.5 }
             },
-            tickingArea: { x: 1500, y: 50, z: -500 }
         },
         stackUp: {
             no1: {
@@ -1191,7 +1387,6 @@ const coords = {
                 pos: { x: 1040.5, y: 50, z: -1000.5 },
                 facing: { x: 1040.5, y: 50, z: -1001.5 }
             },
-            tickingArea: { x: 1000, y: 50, z: -1000 }
         },
         shortDiagonal: {
             no1: {
@@ -1214,7 +1409,6 @@ const coords = {
                 pos: { x: 1531.5, y: 50, z: -970.5 },
                 facing: { x: 1532.5, y: 50, z: -971.5 }
             },
-            tickingArea: { x: 1500, y: 50, z: -1000 }
         },
         diagonal: {
             no1: {
@@ -1237,66 +1431,54 @@ const coords = {
                 pos: { x: 529.5, y: 50, z: -1030.5 },
                 facing: { x: 528.5, y: 50, z: -1031.5 }
             },
-            tickingArea: { x: 500, y: 50, z: -1000 }
         }
     },
     parkour: {
         pcourse1: {
             pos: { x: 500.5, y: 50, z: -1500.5 },
             facing: { x: 500.5, y: 50, z: -1499.5 },
-            tickingArea: { x: 500, y: 50, z: -1500 }
         },
         pcourse2: {
             pos: { x: 1000.5, y: 50, z: -1500.5 },
             facing: { x: 1000.5, y: 50, z: -1499.5 },
-            tickingArea: { x: 1000, y: 50, z: -1500 }
         },
         pcourse3: {
             pos: { x: 1500.5, y: 50, z: -1500.5 },
             facing: { x: 1500.5, y: 50, z: -1499.5 },
-            tickingArea: { x: 1500, y: 50, z: -1500 }
         },
         pcourse4: {
             pos: { x: 2000.5, y: 50, z: -1500.5 },
             facing: { x: 2000.5, y: 50, z: -1499.5 },
-            tickingArea: { x: 2000, y: 50, z: -1500 }
         },
         pcourse5: {
             pos: { x: 2500.5, y: 50, z: -1500.5 },
             facing: { x: 2500.5, y: 50, z: -1499.5 },
-            tickingArea: { x: 2500, y: 50, z: -1500 }
         },
         pcourse6: {
             pos: { x: 500.5, y: 50, z: -2000.5 },
             facing: { x: 500.5, y: 50, z: -1999.5 },
-            tickingArea: { x: 500, y: 50, z: -2000 }
         },
         pcourse7: {
             pos: { x: 1000.5, y: 50, z: -2000.5 },
             facing: { x: 1000.5, y: 50, z: -1999.5 },
-            tickingArea: { x: 1000, y: 50, z: -2000 }
         },
         pcourse8: {
             pos: { x: 1500.5, y: 50, z: -2000.5 },
             facing: { x: 1500.5, y: 50, z: -1999.5 },
-            tickingArea: { x: 1500, y: 50, z: -2000 }
         },
         pcourse9: {
             pos: { x: 2000.5, y: 50, z: -2000.5 },
             facing: { x: 2000.5, y: 50, z: -1999.5 },
-            tickingArea: { x: 2000, y: 50, z: -2000 }
         },
         pcourse10: {
             pos: { x: 2498.5, y: 50, z: -2000.5 },
             facing: { x: 2499.5, y: 50, z: -1999.5 },
-            tickingArea: { x: 2500, y: 50, z: -2000 }
         }
     },
     gauntlet: {
         gcourse1: {
             pos: { x: -1999.5, y: 50, z: -3000.5 },
             facing: { x: -1999.5, y: 50, z: -2999.5 },
-            tickingArea: { x: -2000, y: 0, z: -2950 },
             tracker: [
                 { x: -2003, y: 51, z: -2927 },
                 { x: -2002, y: 49, z: -2937 },
@@ -1333,7 +1515,6 @@ const coords = {
         gcourse2: {
             pos: { x: -999.5, y: 50, z: -3000.5 },
             facing: { x: -999.5, y: 50, z: -2999.5 },
-            tickingArea: { x: -1000, y: 0, z: -2950 },
             tracker: [ 
                 { x: -1001, y: 49, z: -2988 },
                 { x: -1001, y: 49, z: -2987 },
@@ -1376,7 +1557,6 @@ const coords = {
         gcourse3: {
             pos: { x: 0.5, y: 50, z: -3000.5 },
             facing: { x: 0.5, y: 50, z: -2999.5 },
-            tickingArea: { x: -5, y: 0, z: -2950 },
             tracker: [
                 { x: -5, y: 50, z: -2981 },
                 { x: -4, y: 50, z: -2982 },
@@ -1441,7 +1621,6 @@ const coords = {
         gcourse4: {
             pos: { x: 1000.5, y: 50, z: -3000.5 },
             facing: { x: 1000.5, y: 50, z: -2999.5 },
-            tickingArea: { x: 995, y: 0, z: -2980 },
             tracker: [
                 { x: 992, y: 51, z: -2926 },
                 { x: 993, y: 51, z: -2926 },
@@ -1510,7 +1689,6 @@ const coords = {
         gcourse5: {
             pos: { x: 2000.5, y: 50, z: -3000.5 },
             facing: { x: 2000.5, y: 50, z: -2999.5 },
-            tickingArea: { x: 2000, y: 0, z: -2950 },
             tracker: [
                 { x: 1986, y: 50, z: -2922 },
                 { x: 1987, y: 50, z: -2921 },
@@ -1546,7 +1724,6 @@ const coords = {
         gcourse6: {
             pos: { x: -1998.5, y: 50, z: -4000.5 },
             facing: { x: -1999.5, y: 50, z: -3999.5 },
-            tickingArea: { x: -2020, y: 0, z: -3960 },
             tracker: [
                 { x: -2044, y: 55, z: -3958 },
                 { x: -2044, y: 55, z: -3957 },
@@ -1599,7 +1776,6 @@ const coords = {
         gcourse7: {
             pos: { x: -999.5, y: 50, z: -4000.5 },
             facing: { x: -999.5, y: 50, z: -3999.5 },
-            tickingArea: { x: -1000, y: 0, z: -3950 },
             tracker: [
                 { x: -1013, y: 59, z: -3929 },
                 { x: -1009, y: 58, z: -3924 },
@@ -1666,7 +1842,6 @@ const coords = {
         gcourse8: {
             pos: { x: 0.5, y: 50, z: -4000.5 },
             facing: { x: 0.5, y: 50, z: -3999.5 },
-            tickingArea: { x: -5, y: 0, z: -3950 },
             tracker: [
                 { x: -7, y: 54, z: -3949 },
                 { x: -7, y: 56, z: -3942 },
@@ -1739,7 +1914,6 @@ const coords = {
         gcourse9: {
             pos: { x: 1000.5, y: 50, z: -4000.5 },
             facing: { x: 1000.5, y: 50, z: -3999.5 },
-            tickingArea: { x: 995, y: 0, z: -3950 },
             tracker: [
                 { x: 985, y: 59, z: -3927 },
                 { x: 985, y: 59, z: -3926 },
@@ -1831,7 +2005,6 @@ const coords = {
         gcourse10: {
             pos: { x: 2000.5, y: 50, z: -4000.5 },
             facing: { x: 2000.5, y: 50, z: -3999.5 },
-            tickingArea: { x: 1995, y: 0, z: -3950 },
             tracker: [
                 { x: 1992, y: 54, z: -3937 },
                 { x: 1992, y: 54, z: -3936 },
@@ -1953,21 +2126,18 @@ world.afterEvents.playerSpawn.subscribe(evd=>{
     if (!evd.initialSpawn) return;
     const player = evd.player;
     if (worldOwnerName === null) {
-        worldOwnerName = player.name;
+        // Remember the owner so it survives a restart
+        worldOwnerName = world.getDynamicProperty('worldOwner') ?? player.name;
+        world.setDynamicProperty('worldOwner', worldOwnerName);
     }
     getPlayerBestTimes(player);
-    // If < 2 players total, delete all ticking areas
-    const totalPlayers = world.getPlayers().length;
-    if (totalPlayers < 2) {
-        deleteAllTickingAreas();
-    }
     hub(player);
     player.setGameMode("Survival");
     player.sendMessage('§8-------------------------------');
     player.sendMessage('§3Welcome to §bBridgeCore!');
     player.sendMessage('§3  - Creator: §bhippox1');
     player.sendMessage('§3  - Collaborator: §bpersephone');
-    player.sendMessage('§3  - Version: §bRelease 1.0');
+    player.sendMessage('§3  - Version: §bRelease 1.1');
     player.sendMessage('§3  - Community: §bdiscord.gg/XNfSKUs38D');
     player.sendMessage('§8-------------------------------');
     player.sendMessage('§7  - /commands for more information');
@@ -1978,12 +2148,9 @@ world.afterEvents.playerSpawn.subscribe(evd=>{
 
 // Player leave event - clear blocks placed by non-owner players
 world.afterEvents.playerLeave.subscribe(evd => {
-    const player = evd.playerName;
-    
-    // Only clear blocks if leaving player is NOT the owner
-    if (player !== worldOwnerName) {
-        clearPlacedBlocksForPlayer(player);
-        deletePlayerTickingArea(player);
+    // The owner keeps their blocks. Everyone else has their saved blocks cleared in the background.
+    if (evd.playerName !== worldOwnerName) {
+        clearBlocksOfLeavingPlayer(evd.playerName);
     }
 });
 
@@ -2038,8 +2205,6 @@ function hub(player) {
     }
     player.runCommand("clear @s");
     player.runCommand("effect @s clear");
-    // Delete only this player's ticking area (not all ticking areas)
-    deletePlayerTickingArea(player.name);
     deleteAllTagsAndAddHub(player);
     player.setGameMode("Survival");
     player.teleport({ x: 0.5, y: 50, z: 0.5 }, {facingLocation: { x: 0.5, y: 50, z: 1.5}});
@@ -2107,7 +2272,7 @@ system.beforeEvents.startup.subscribe(({ customCommandRegistry }) => {
     );
     customCommandRegistry.registerCommand(
         {
-            name: "server:reset",
+            name: "server:resetall",
             description: "Resets all your best times",
             permissionLevel: CommandPermissionLevel.Any,
             cheatsRequired: true,
@@ -2117,6 +2282,21 @@ system.beforeEvents.startup.subscribe(({ customCommandRegistry }) => {
                 return { status: CustomCommandStatus.Failure, message: "§cOnly players can use this command" };
             }
             resetAllBestTimes(player);
+            return { status: CustomCommandStatus.Success };
+        }
+    );
+    customCommandRegistry.registerCommand(
+        {
+            name: "server:reset",
+            description: "Resets the best time for your current mode",
+            permissionLevel: CommandPermissionLevel.Any,
+            cheatsRequired: true,
+        },
+        ({ sourceEntity: player }) => {
+            if (!(player instanceof Player)) {
+                return { status: CustomCommandStatus.Failure, message: "§cOnly players can use this command" };
+            }
+            resetCurrentModeBestTime(player);
             return { status: CustomCommandStatus.Success };
         }
     );
@@ -2193,41 +2373,13 @@ system.beforeEvents.startup.subscribe(({ customCommandRegistry }) => {
             player.sendMessage('/hub §7- Teleport to the hub');
             player.sendMessage('/lobby §7- Teleport to the lobby');
             //player.sendMessage('/changemode §7- Change your mode (not in freestyle)');
-            player.sendMessage('/reset §7- Reset all your best times');
+            player.sendMessage('/reset §7- Reset your current mode best times');
+            player.sendMessage('/resetall §7- Reset all your best times');
             player.sendMessage('/commands §7- Show this help message');
             player.sendMessage('§8-------------------------------');
             player.sendMessage('§b§lNotes:');
             player.sendMessage('§7- The map is multiplayer compatible');
             player.sendMessage('§7- /admin for destroying missplaced blocks and such (world owner only)');
-            player.sendMessage('§8-------------------------------');
-            
-            return { status: CustomCommandStatus.Success };
-        }
-    );
-    customCommandRegistry.registerCommand(
-        {
-            name: "server:areas",
-            description: "Shows all existing ticking areas",
-            permissionLevel: CommandPermissionLevel.Any,
-            cheatsRequired: true,
-        },
-        ({ sourceEntity: player }) => {
-            if (!(player instanceof Player)) {
-                return { status: CustomCommandStatus.Failure, message: "§cOnly players can use this command" };
-            }
-            
-            player.sendMessage('§8-------------------------------');
-            player.sendMessage('§b§lActive Ticking Areas:');
-            player.sendMessage('§8-------------------------------');
-            
-            if (playerTickingAreas.size === 0) {
-                player.sendMessage('§7No active ticking areas');
-            } else {
-                for (const [playerName, areaName] of playerTickingAreas) {
-                    player.sendMessage(`§b${playerName}: §r${areaName}`);
-                }
-            }
-            
             player.sendMessage('§8-------------------------------');
             
             return { status: CustomCommandStatus.Success };
@@ -2591,13 +2743,10 @@ function handleNoScore(player) {
     player.removeTag('hub');
     player.addTag('freestyle');
     player.addTag('noScore');
-    // Always create ticking area for noscore
-    const tickingAreaPos = coords.freestyle.noScore.tickingArea;
-    createTickingArea(tickingAreaPos, player.name);
     player.teleport(coords.freestyle.noScore.pos);
-    giveItem(player);
-    clearPlacedBlocksForPlayer(player);
+    player.runCommand('clear @s');
     totalBlocks.set(player, 0);
+    resetPlacedBlocks(player, 'freestyle', 'noScore', () => giveItem(player));
 }
 
 function handlePatternLearning(player) {
@@ -2613,18 +2762,13 @@ function handlePatternLearning(player) {
     // Get stored detector coords
     const coords_list = getPatternCoordsForPlayer(player);
     
-    // Always create ticking area for pattern learning
-    const tickingAreaPos = coords.freestyle.patternLearning.tickingArea;
-    createTickingArea(tickingAreaPos, player.name);
-    
-    // Teleport to position
     player.teleport(coords.freestyle.patternLearning.pos);
-    giveItem(player);
-    clearPlacedBlocksForPlayer(player);
+    player.runCommand('clear @s');
     totalBlocks.set(player, 0);
     
-    // Replace all trackers to detectors based on coords list (even if empty)
-    system.runTimeout(() => {
+    // Clear the previous attempt first, then restore the trackers and give items
+    resetPlacedBlocks(player, 'freestyle', 'patternLearning', () => {
+        giveItem(player);
         replaceDetectorsWithTrackers(player);
         // Check if pattern coords list is empty and send message
         if (!coords_list || coords_list.length === 0) {
@@ -2633,20 +2777,17 @@ function handlePatternLearning(player) {
             player.sendMessage('§7Use §bEdit Pattern §7to create a pattern');
             player.sendMessage('§8-------------------------------');
         }
-    }, 5);
+    });
 }
 
 function handleCustomIsland(player) {
     player.removeTag('hub');
     player.addTag('freestyle');
     player.addTag('customisland');
-    // Always create ticking area for custom island
-    const tickingAreaPos = coords.freestyle.customIsland.tickingArea;
-    createTickingArea(tickingAreaPos, player.name);
     player.teleport(coords.freestyle.customIsland.pos);
-    giveItem(player);
-    clearPlacedBlocksForPlayer(player);
+    player.runCommand('clear @s');
     totalBlocks.set(player, 0);
+    resetPlacedBlocks(player, 'freestyle', 'customIsland', () => giveItem(player));
 }
 
 function handleOneBlock(player) {
@@ -2657,13 +2798,10 @@ function handleOneBlock(player) {
     player.removeTag('hub');
     player.addTag('freestyle');
     player.addTag('oneblock');
-    // Always create ticking area for one block
-    const tickingAreaPos = coords.freestyle.oneBlock.tickingArea;
-    createTickingArea(tickingAreaPos, player.name);
     player.teleport(coords.freestyle.oneBlock.pos);
-    giveItem(player);
-    clearPlacedBlocksForPlayer(player);
+    player.runCommand('clear @s');
     totalBlocks.set(player, 0);
+    resetPlacedBlocks(player, 'freestyle', 'oneBlock', () => giveItem(player));
 }
 
 function handleSpeedbridge(player) {
@@ -2723,16 +2861,7 @@ function handleSpeedbridge(player) {
         const posData = modeCoords[`no${selectedPosition}`];
         player.teleport(posData.pos, { facingLocation: posData.facing });
         player.runCommand('clear @s');
-        system.runTimeout(() => {
-            giveItem(player);
-            clearPlacedBlocksForPlayer(player);
-        }, 20);
-        
-        const playersInMode = countPlayersInSpeedBridgeMode(selectedMode);
-        if (playersInMode === 1) {
-            const tickingAreaPos = modeCoords.tickingArea;
-            createTickingArea(tickingAreaPos, player.name);
-        }
+        resetPlacedBlocks(player, 'speedbridge', selectedMode, () => giveItem(player));
         player.sendMessage(`§b${player.name}§r has joined §b${selectedMode}§r at island §b${selectedPosition}`);
     });
 }
@@ -2757,6 +2886,7 @@ function handleBedwarsRush(player) {
     bedwarsForm.show(player).then(r => {
         if (r.canceled) return;
         
+        
         player.removeTag('hub');
         player.addTag('run');
         player.addTag('bedwarsrush');
@@ -2778,13 +2908,12 @@ function handleBedwarsRush(player) {
         const mapCoords = coords.rush[selectedMap];
         player.teleport(mapCoords.pos, { facingLocation: mapCoords.facing });
         player.runCommand('clear @s');
-        system.runTimeout(() => {
+        player.onScreenDisplay.setActionBar("§7Loading map...");
+        resetPlacedBlocks(player, 'bedwarsRush', selectedMap, () => {
             giveItem(player);
-            clearPlacedBlocksForPlayer(player);
-        }, 20);
-        
-        const tickingAreaPos = mapCoords.tickingArea;
-        createTickingArea(tickingAreaPos, player.name);
+            player.playSound("random.orb");
+            player.onScreenDisplay.setActionBar("§aMap loaded successfully!");
+        });
         player.sendMessage(`§b${player.name}§r has joined §b${selectedMap}§r`);
     });
 }
@@ -2832,13 +2961,7 @@ function handleParkour(player) {
         const courseCoords = coords.parkour[selectedCourse];
         player.teleport(courseCoords.pos, { facingLocation: courseCoords.facing });
         player.runCommand('clear @s');
-        system.runTimeout(() => {
-            giveItem(player);
-            clearPlacedBlocksForPlayer(player);
-        }, 20);
-        
-        const tickingAreaPos = courseCoords.tickingArea;
-        createTickingArea(tickingAreaPos, player.name);
+        resetPlacedBlocks(player, 'parkour', selectedCourse, () => giveItem(player));
         player.sendMessage(`§b${player.name}§r has joined §b${selectedCourse}§r`);
     });
 }
@@ -2886,15 +3009,10 @@ function handleGauntlet(player) {
         const courseCoords = coords.gauntlet[selectedCourse];
         player.teleport(courseCoords.pos, { facingLocation: courseCoords.facing });
         player.runCommand('clear @s');
-        system.runTimeout(() => {
+        resetPlacedBlocks(player, 'gauntlet', selectedCourse, () => {
             giveItem(player);
-            clearPlacedBlocksForPlayer(player);
-        }, 20);
-        
-        replaceTracker(player);
-        
-        const tickingAreaPos = courseCoords.tickingArea;
-        createTickingArea(tickingAreaPos, player.name);
+            replaceTracker(player);
+        });
         player.sendMessage(`§b${player.name}§r has joined §b${selectedCourse}§r`);
     });
 }
